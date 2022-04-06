@@ -1,3 +1,13 @@
+# Build folder
+build/
+
+# Visual Studio (Code) 
+.vs/
+.vscode/
+
+# Cache
+.cache/
+
 # Prerequisites
 *.d
 

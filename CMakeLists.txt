@@ -27,15 +27,13 @@
 ## Setup vcpkg toolchain                                                             ##
 ## Needs to be done at the root of CMake, before defining the project                ##
 #######################################################################################
-set(VCPKG_VERSION latest) # latest: uses latest tag
-                          # edge: use latest commit on master branch
 include(cmake/vcpkg.cmake)
 
 
 #######################################################################################
 ## Project                                                                           ##
 #######################################################################################
-cmake_minimum_required(VERSION 3.12)
+cmake_minimum_required(VERSION 3.20)
 project(boilerplate-vcpkg-cmake VERSION 1.0.0)
 
 

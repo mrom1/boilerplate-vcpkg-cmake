@@ -33,10 +33,12 @@
 ## - VCPKG_NO_INSTALL: If set there will be no action triggered from this script.    ##
 ## - VCPKG_FORCE_INSTALL: If this variable is set the script will force cloning      ##
 ##                        and installing vcpkg each time you include this script.    ##
-##                        Default behaviour is to not set the variable.              ##
+##                        Default behaviour is to disable this feature.              ##
 #######################################################################################
-cmake_minimum_required(VERSION 3.2)
+cmake_minimum_required(VERSION 3.20)
 
+
+set(VCPKG_REPO_URL "https://github.com/Microsoft/vcpkg.git")
 
 #######################################################################################
 ## Git dependency                                                                    ##
@@ -47,260 +49,23 @@ find_package(Git REQUIRED)
 #######################################################################################
 ## Function: vcpkg_install                                                           ##
 ##                                                                                   ##
-## - Clones vcpkg from git repo and installs it to VCPKG_INSTALL_DIR                 ##
+## - Installs vcpkg if necessary.                                                    ##
 #######################################################################################
 function(vcpkg_install)
-    # If not specified which version to use, use the latest tagged release version.
-    if (NOT DEFINED VCPKG_VERSION)
-        set(VCPKG_VERSION "latest")
+    if(NOT DEFINED VCPKG_VERSION OR VCPKG_VERSION EQUAL "")
+        set(VCPKG_VERSION latest)
     endif()
+    
+    vcpkg_check_environment(VCPKG_ENVIRONMENT_OK)
 
-    # Check if vcpkg is already installed
-    if (NOT DEFINED VCPKG_EXECUTABLE 
-        OR VCPKG_EXECUTABLE EQUAL "" 
-        OR DEFINED VCPKG_FORCE_INSTALL)
-
-        # If no path has been specified for vcpkg, then use the build folder
-        if(VCPKG_INSTALL_DIR EQUAL "" OR NOT DEFINED VCPKG_INSTALL_DIR)
-            set(VCPKG_INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}/")
-        endif()
-        string(REGEX REPLACE "[/\\]$" "" VCPKG_INSTALL_DIR "${VCPKG_INSTALL_DIR}")
-
-        message(STATUS "[vcpkg] Installing vcpkg at: ${VCPKG_INSTALL_DIR}")
-
-        # Make sure git executable is defined and found.
-        if (GIT_EXECUTABLE EQUAL "" OR NOT DEFINED GIT_EXECUTABLE)
-            message(FATAL_ERROR 
-                "[vcpkg] Git is necessary for downloading vcpkg! "
-                "Unable to find git executable. Please make sure to "
-                "have git installed and in your path.")
-        else()
-            message(STATUS "[vcpkg] Git found at: ${GIT_EXECUTABLE}")
-        endif()
-
-        set(VCPKG_ROOT_DIR "${VCPKG_INSTALL_DIR}/vcpkg")
-
-        # Check if vcpkg needs to be cloned
-        if (NOT EXISTS ${VCPKG_ROOT_DIR})
-            vcpkg_clone_repository()
-        endif()
-        
-        vcpkg_check_integrity(INTEGRITY_CHECK_OK)
-        if(NOT INTEGRITY_CHECK_OK EQUAL "0")
-            # The vcpkg folder which exists failed the integrity check.
-            # Remove the folder and clone again.
-            message(STATUS "[vcpkg] Removing ${VCPKG_ROOT_DIR}")
-            file(REMOVE_RECURSE ${VCPKG_ROOT_DIR})
-            vcpkg_clone_repository()
-        endif()
-
-        # At this point in the script we should have a working clone
-        # of the vcpkg repository and can start bootstrapping
+    if(${VCPKG_ENVIRONMENT_OK})
+        message(STATUS  "[vcpkg] Found VCPKG Executable: ${VCPKG_EXECUTABLE}")
+        message(STATUS  "[vcpkg] Found VCPKG Version: ${VCPKG_INSTALLED_VERSION}")
+    else()
+        vcpkg_git_clone_repository()
         vcpkg_execute_bootstrap()
-
-        # Setting the vcpkg executable
-        vcpkg_set_executable()
-    else()
-        message(STATUS "[vcpkg] Executable found at ${VCPKG_EXECUTABLE}")
+        vcpkg_set_environment()
     endif()
-
-    # Cache VCPKG_EXECUTABLE
-    set(VCPKG_EXECUTABLE ${VCPKG_EXECUTABLE} 
-        CACHE STRING "vcpkg executable location" FORCE)
-
-    # Setting CMAKE_TOOLCHAIN_FILE
-    set(CMAKE_TOOLCHAIN_FILE "${VCPKG_TOOLCHAIN_FILE}")
-    set(CMAKE_TOOLCHAIN_FILE ${CMAKE_TOOLCHAIN_FILE} PARENT_SCOPE)
-    set(CMAKE_TOOLCHAIN_FILE ${CMAKE_TOOLCHAIN_FILE} CACHE STRING "")
-
-endfunction()
-
-
-#######################################################################################
-## Function: vcpkg_set_executable                                                    ##
-##                                                                                   ##
-## - Sets the executable binary based on VCPKG_ROOT_DIR                              ##
-#######################################################################################
-function(vcpkg_set_executable)
-    if (NOT EXISTS ${VCPKG_ROOT_DIR})
-        message(FATAL_ERROR "[vcpkg] Unable to find vcpkg root directory!")
-    endif()
-
-    if(WIN32)
-        if(EXISTS "${VCPKG_ROOT_DIR}/vcpkg.exe")
-            set(VCPKG_EXECUTABLE "${VCPKG_ROOT_DIR}/vcpkg.exe" PARENT_SCOPE)
-        endif()
-    else()
-        if(EXISTS "${VCPKG_ROOT_DIR}/vcpkg")
-            set(VCPKG_EXECUTABLE "${VCPKG_ROOT_DIR}/vcpkg" PARENT_SCOPE)
-        endif()
-    endif()
-endfunction()
-
-
-#######################################################################################
-## Function: vcpkg_execute_bootstrap                                                 ##
-##                                                                                   ##
-## - Executes the bootstrap script inside the vcpkg folder                           ##
-#######################################################################################
-function(vcpkg_execute_bootstrap)
-    message(STATUS "[vcpkg] Executing bootstrap script ...")
-
-    if(NOT EXISTS ${VCPKG_BOOTSTRAP_FILE})
-        message(FATAL_ERROR "[vcpkg] Bootstrap file not found!")
-    endif()
-    
-    execute_process(
-        COMMAND bash ${VCPKG_BOOTSTRAP_FILE} -disableMetrics
-        WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
-        OUTPUT_QUIET
-        RESULT_VARIABLE VCPKG_BUILD_OK)
-    
-    if(NOT VCPKG_BUILD_OK EQUAL "0")
-        message(FATAL_ERROR "[vcpkg] Bootstrapping VCPKG failed!")
-    else()
-        message(STATUS "[vcpkg] Built VCPKG successfully!")
-    endif()
-endfunction()
-
-
-#######################################################################################
-## Function: vcpkg_clone_repository                                                  ##
-##                                                                                   ##
-## - Clones the repository inside VCPKG_INSTALL_DIR                                  ##
-#######################################################################################
-function(vcpkg_clone_repository)
-
-    message(STATUS "[vcpkg] Cloning vcpkg version: '${VCPKG_VERSION}' ...")
-    # Check for specified vcpkg version and start cloning the vcpkg repo
-    if (VCPKG_VERSION STREQUAL "edge")
-        # Clone the latest commit from the vcpkg repo using default branch (master)
-        # Command: "git clone --depth 1 https://github.com/Microsoft/vcpkg.git"
-
-        set(CLONE_ARGS "clone;\--depth;1;https://github.com/Microsoft/vcpkg.git")
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} ${CLONE_ARGS}
-            WORKING_DIRECTORY ${VCPKG_INSTALL_DIR}
-            OUTPUT_QUIET
-            RESULT_VARIABLE VCPKG_GIT_CLONE_OK)
-
-        if(NOT VCPKG_GIT_CLONE_OK EQUAL "0")
-            message(FATAL_ERROR "Cloning vcpkg repository failed!")
-        endif()
-
-    elseif (VCPKG_VERSION STREQUAL "latest")
-        # Clone latest tagged release version from the vcpkg repo
-        # Commands:
-        #   git clone https://github.com/Microsoft/vcpkg.git
-        #   latest_tag = $(git describe --tags `git rev-list --tags --max-count=1`)
-        #   git checkout $latest_tag
-
-        set(CLONE_ARGS "clone;https://github.com/Microsoft/vcpkg.git")
-        set(REV_LIST_ARGS "rev-list;--tags;--max-count=1")
-        set(DESCRIBE_ARGS "describe;--tags")
-
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} ${CLONE_ARGS}
-            WORKING_DIRECTORY ${VCPKG_INSTALL_DIR}
-            OUTPUT_QUIET
-            RESULT_VARIABLE VCPKG_GIT_CLONE_OK)
-
-        if(NOT VCPKG_GIT_CLONE_OK EQUAL "0")
-            message(FATAL_ERROR "[vcpkg] Cloning vcpkg repository failed!")
-        endif()
-
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} ${REV_LIST_ARGS}
-            WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
-            OUTPUT_VARIABLE VCPKG_GIT_TAG_SHA1_LATEST
-            RESULT_VARIABLE VCPKG_GIT_TAG_LATEST_OK
-            OUTPUT_STRIP_TRAILING_WHITESPACE)
-        
-        if(NOT VCPKG_GIT_TAG_LATEST_OK EQUAL "0")
-            message(FATAL_ERROR "[vcpkg] Getting vcpkg repository revision list failed!")
-        endif()
-
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} ${DESCRIBE_ARGS} ${VCPKG_GIT_TAG_SHA1_LATEST}
-            WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
-            OUTPUT_VARIABLE VCPKG_GIT_TAG_NAME_LATEST
-            RESULT_VARIABLE VCPKG_GIT_TAG_NAME_LATEST_OK)
-        string(REGEX REPLACE "\n$" "" VCPKG_GIT_TAG_NAME_LATEST "${VCPKG_GIT_TAG_NAME_LATEST}")
-        
-        if(NOT VCPKG_GIT_TAG_NAME_LATEST_OK EQUAL "0")
-            message(FATAL_ERROR "[vcpkg] Getting vcpkg latest tag failed!")
-        endif()
-
-        message(STATUS "[vcpkg] Checking out latest tag: ${VCPKG_GIT_TAG_NAME_LATEST}")
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} checkout ${VCPKG_GIT_TAG_NAME_LATEST}
-            WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
-            OUTPUT_QUIET
-            ERROR_QUIET
-            RESULT_VARIABLE VCPKG_GIT_CHECKOUT_OK)
-        
-        if(NOT VCPKG_GIT_CHECKOUT_OK EQUAL "0")
-            message(FATAL_ERROR "[vcpkg] Checkout for tag ${VCPKG_GIT_TAG_NAME_LATEST} failed!")
-        endif()
-
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
-            WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
-            OUTPUT_VARIABLE VCPKG_GIT_CURRENT_COMMIT_SHA1
-            RESULT_VARIABLE VCPKG_GIT_CURRENT_COMMIT_SHA1_OK)
-
-        if(NOT VCPKG_GIT_CURRENT_COMMIT_SHA1_OK EQUAL "0")
-            message(FATAL_ERROR "[vcpkg] Getting vcpkg SHA1 revision failed!")
-        endif()
-    else()
-        # no version or invalid version has been specificed
-        message(FATAL_ERROR 
-            "[vcpkg] Invalid version has been specified ('${VCPKG_VERSION}'). "
-            "Please set the VCPKG_VERSION variable to either 'edge' or 'latest' "
-            "before including the vcpkg.cmake file.")
-    endif()
-endfunction()
-
-
-#######################################################################################
-## Function: vcpkg_check_integrity                                                   ##
-##                                                                                   ##
-## - Checks if the cloned repository is compatible to the specified version.         ##
-##                                                                                   ##
-## Args:                                                                             ##
-##  - OUTPUT_RESULT:                                                                 ##
-##      - "SUCCESS": Indicates that the cloned repository can be used.               ##
-##      - "FAILURE": Indicates that the repository should be cloned again.           ##
-#######################################################################################
-function(vcpkg_check_integrity OUTPUT_RESULT)
-    get_filename_component(
-        VCPKG_TOOLCHAIN_FILE 
-        "${VCPKG_ROOT_DIR}/scripts/buildsystems/vcpkg.cmake"
-        ABSOLUTE)
-
-    if(WIN32)
-        get_filename_component(
-            VCPKG_BOOTSTRAP_FILE
-            "${VCPKG_ROOT_DIR}/bootstrap-vcpkg.bat"
-            ABSOLUTE)
-    else()
-        get_filename_component(
-            VCPKG_BOOTSTRAP_FILE
-            "${VCPKG_ROOT_DIR}/bootstrap-vcpkg.sh"
-            ABSOLUTE)
-    endif()
-
-    if(NOT EXISTS ${VCPKG_TOOLCHAIN_FILE} OR NOT EXISTS ${VCPKG_BOOTSTRAP_FILE})
-        message(WARNING 
-            "[vcpkg] Cloned folder at ${VCPKG_ROOT_DIR} seems corrupted. "
-            "Performing clean install...")
-        set(${OUTPUT_RESULT} -1 PARENT_SCOPE)
-        return()
-    endif()
-
-    set(VCPKG_BOOTSTRAP_FILE ${VCPKG_BOOTSTRAP_FILE} PARENT_SCOPE)
-    set(VCPKG_TOOLCHAIN_FILE ${VCPKG_TOOLCHAIN_FILE} PARENT_SCOPE)
-    set(${OUTPUT_RESULT} 0 PARENT_SCOPE)
 endfunction()
 
 
@@ -321,6 +86,555 @@ function(vcpkg_install_package PACKAGE_NAME)
         endif()
     else()
         message(FATAL_ERROR "[vcpkg] Failed to find the vcpkg executable.")
+    endif()
+endfunction()
+
+
+#######################################################################################
+## Function: vcpkg_check_environment                                                 ##
+##                                                                                   ##
+## - Checks the environment.                                                         ##
+##                                                                                   ##
+## Args:                                                                             ##
+##  - RESULT:                                                                        ##
+##      'True': Successful installation found, can be used immediately.              ##
+##      'False': No installation found, needs to be cloned.                          ##
+#######################################################################################
+function(vcpkg_check_environment RESULT)
+    if(DEFINED VCPKG_FORCE_INSTALL)
+        # Going to force installation anyway, nothing more to check.
+        message(STATUS "[vcpkg] Force Installtion: ON")
+        set(${RESULT} False PARENT_SCOPE)
+        return()
+    elseif(DEFINED ENV{VCPKG_ROOT} AND EXISTS $ENV{VCPKG_ROOT})
+        # The environment variable VCPKG_ROOT gets defined by the vcpkg installer.
+        # This script nerver sets this variable, i.e. if it is set that must mean
+        # there is a known vcpkg installation already.
+        message(STATUS 
+            "[vcpkg] Environment variable VCPKG_ROOT defined: $ENV{VCPKG_ROOT}")
+        set(VCPKG_ROOT_DIR $ENV{VCPKG_ROOT})
+        set(VCPKG_ROOT_DIR $ENV{VCPKG_ROOT} PARENT_SCOPE)
+    elseif(DEFINED VCPKG_ROOT_DIR AND EXISTS ${VCPKG_ROOT_DIR})
+        set(VCPKG_ROOT_DIR ${VCPKG_ROOT_DIR} PARENT_SCOPE)
+    else()
+        message(STATUS "[vcpkg] No installation found.")
+        set(${RESULT} False PARENT_SCOPE)
+        return()
+    endif()
+
+    # Check if the git repository is reachable
+    vcpkg_git_repository_reachable(VCPKG_GIT_REPOSITORY_REACHABLE_OK)
+    if(NOT ${VCPKG_GIT_REPOSITORY_REACHABLE_OK})
+        message(STATUS 
+            "[vcpkg] Git repository not reachable, check your internet connection!")
+        set(VCPKG_INSTALLED_VERSION ${VCPKG_INSTALLED_VERSION} PARENT_SCOPE)
+        set(${RESULT} True PARENT_SCOPE)
+        return()
+    endif()
+
+    # Check if the vcpkg version found is on the desired version or if corrupted.
+    vcpkg_check_version(VCPKG_CHECK_VERSION_OK)
+    if(NOT VCPKG_CHECK_VERSION_OK)
+        message(STATUS "[vcpkg] Installed version needs to be updated!")
+        set(${RESULT} False PARENT_SCOPE)
+        return()
+    endif()
+
+    set(VCPKG_INSTALLED_VERSION ${VCPKG_INSTALLED_VERSION} PARENT_SCOPE)
+    set(${RESULT} True PARENT_SCOPE)
+endfunction()
+
+
+#######################################################################################
+## Function: vcpkg_check_version                                                     ##
+##                                                                                   ##
+## - Verify the found vcpkg version against the desired (configured) version.        ##
+##                                                                                   ##
+## Args:                                                                             ##
+##  - RESULT:                                                                        ##
+##      - 'True': Success. Version can be used.                                      ##
+##      - 'False': Failure. VCPKG should be cloned / checked out again.              ##
+#######################################################################################
+function(vcpkg_check_version RESULT)
+    message(STATUS "[vcpkg] Checking version of vcpkg...")  
+    
+    # Check vcpkg has already been bootstrapped
+    if(WIN32)
+        set(VCPKG_EXECUTABLE_NAME "vcpkg.exe")
+    else()
+        set(VCPKG_EXECUTABLE_NAME "vcpkg")
+    endif()
+
+    if(EXISTS "${VCPKG_ROOT_DIR}/${VCPKG_EXECUTABLE_NAME}")
+        set(VCPKG_EXECUTABLE "${VCPKG_ROOT_DIR}/${VCPKG_EXECUTABLE_NAME}")
+    else()
+        set(${RESULT} False PARENT_SCOPE)
+        return()
+    endif()
+
+    execute_process(
+        COMMAND ${VCPKG_EXECUTABLE} version 
+        RESULT_VARIABLE VCPKG_TEST_RETVAL 
+        OUTPUT_VARIABLE VCPKG_VERSION_OUTPUT
+    )
+
+    if(NOT (${VCPKG_TEST_RETVAL} EQUAL "0"))
+        set(${RESULT} False PARENT_SCOPE)
+        return()
+    endif()
+
+    string(REGEX MATCH "([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9])-([0-9a-zA-Z]+)"
+        VCPKG_INSTALLED_VERSION ${VCPKG_VERSION_OUTPUT})
+
+    if(VCPKG_VERSION STREQUAL "edge")
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} ls-remote ${VCPKG_REPO_URL} HEAD
+            OUTPUT_VARIABLE VCPKG_LATEST_HEAD
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        string(SUBSTRING ${VCPKG_LATEST_HEAD} 0 40 VCPKG_MOST_RECENT_HASH)
+
+    elseif(VCPKG_VERSION STREQUAL "latest")
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} ls-remote --tags ${VCPKG_REPO_URL}
+            OUTPUT_VARIABLE VCPKG_LATEST_TAGS_LIST
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            
+        )
+        string(FIND ${VCPKG_LATEST_TAGS_LIST} "\n" POSITION_LAST_NEWLINE REVERSE)
+        string(LENGTH ${VCPKG_LATEST_TAGS_LIST} TAGS_LENGTH)
+        math(EXPR OUTPUT_HASH_STARTBYTE "${POSITION_LAST_NEWLINE}+1")
+        string(SUBSTRING ${VCPKG_LATEST_TAGS_LIST} ${OUTPUT_HASH_STARTBYTE} 40 VCPKG_MOST_RECENT_HASH)
+
+    else()
+        # Invalid version has been specificed
+        message(FATAL_ERROR 
+            "[vcpkg] Invalid version has been specified ('${VCPKG_VERSION}'). "
+            "Please set the VCPKG_VERSION variable to either 'edge' or 'latest' "
+            "before including the vcpkg.cmake file.")
+    endif()
+
+    vcpkg_git_execute_command(
+        COMMAND rev-parse
+        ARGS_LIST HEAD
+        WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
+        OUTPUT VCPKG_CURRENT_ACTIVE_HASH
+    )
+
+    if(VCPKG_VERSION STREQUAL "latest")
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} describe --tags --exact-match ${VCPKG_CURRENT_ACTIVE_HASH}
+            WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
+            RESULT_VARIABLE VCPKG_CURRENT_REVISION_IS_TAG
+            OUTPUT_QUIET
+        )
+        if(NOT (VCPKG_CURRENT_REVISION_IS_TAG EQUAL 0))
+            # Current version is not a tag.
+            set(${RESULT} False PARENT_SCOPE)
+            return()
+        endif()
+    endif()
+
+    vcpkg_git_compare_timestamp(
+        INPUT_VERSION ${VCPKG_CURRENT_ACTIVE_HASH}
+        BASELINE_VERSION ${VCPKG_MOST_RECENT_HASH}
+        RESULT GIT_COMPARE_TIMESTAMP_RESULT)
+
+    if(GIT_COMPARE_TIMESTAMP_RESULT LESS 0)
+        message(STATUS "[vcpkg] Version found at ${VCPKG_ROOT_DIR} is outdated!")
+        set(${RESULT} False PARENT_SCOPE)
+        return()
+    endif()
+
+    set(VCPKG_INSTALLED_VERSION ${VCPKG_INSTALLED_VERSION} PARENT_SCOPE)
+    set(${RESULT} True PARENT_SCOPE)
+endfunction()
+
+
+#######################################################################################
+## Function: vcpkg_git_clone_repository                                              ##
+##                                                                                   ##
+## - Clones the vcpkg repository.                                                    ##
+#######################################################################################
+function(vcpkg_git_clone_repository)
+    # If no path has been specified for installing vcpkg, then use the build folder
+    if(VCPKG_INSTALL_DIR EQUAL "" OR NOT DEFINED VCPKG_INSTALL_DIR)
+        set(VCPKG_INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}/")
+        set(VCPKG_INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}/" PARENT_SCOPE)
+    endif()
+    string(REGEX REPLACE "[/\\]$" "" VCPKG_INSTALL_DIR "${VCPKG_INSTALL_DIR}")
+
+    if(VCPKG_ROOT_DIR EQUAL "" OR NOT DEFINED VCPKG_ROOT_DIR)
+        set(VCPKG_ROOT_DIR "${VCPKG_INSTALL_DIR}/vcpkg")
+        set(VCPKG_ROOT_DIR "${VCPKG_INSTALL_DIR}/vcpkg" PARENT_SCOPE)
+    endif()
+
+    if(EXISTS ${VCPKG_ROOT_DIR} AND DEFINED VCPKG_FORCE_INSTALL)
+        vcpkg_is_path_in_project(PATH ${VCPKG_ROOT_DIR} RESULT IS_IN_PATH)
+        if(${IS_IN_PATH})
+            message(STATUS "[vcpkg] Forcing reinstall.. removing ${VCPKG_ROOT_DIR}")
+            file(REMOVE_RECURSE ${VCPKG_ROOT_DIR})
+        endif()
+    endif()
+
+    if(NOT EXISTS ${VCPKG_ROOT_DIR})
+        message(STATUS "[vcpkg] Cloning repository...")
+        vcpkg_git_execute_command(
+            COMMAND clone 
+            ARGS_LIST ${VCPKG_REPO_URL}
+            WORKING_DIRECTORY ${VCPKG_INSTALL_DIR}
+        )    
+    endif()
+
+    message(STATUS "[vcpkg] Fetching Updates ...")
+    vcpkg_git_execute_command(
+        COMMAND fetch
+        ARGS_LIST origin
+        WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
+    )
+
+    if(VCPKG_VERSION STREQUAL "edge")
+        message(STATUS "[vcpkg] Updating vcpkg to version '${VCPKG_VERSION}' ...")
+        vcpkg_git_execute_command(
+            COMMAND reset
+            ARGS_LIST --hard origin/master
+            WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
+        )
+    elseif(VCPKG_VERSION STREQUAL "latest")
+        vcpkg_git_execute_command(
+            COMMAND rev-list
+            ARGS_LIST --tags --max-count=1
+            WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
+            OUTPUT GIT_REVISION_VERSION
+        )
+
+        vcpkg_git_execute_command(
+            COMMAND describe
+            ARGS_LIST --tags ${GIT_REVISION_VERSION}
+            WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
+            OUTPUT GIT_LATEST_TAG_NAME
+        )
+
+        message(STATUS "[vcpkg] Checking out latest release tag '${GIT_LATEST_TAG_NAME}' ...")
+        vcpkg_git_execute_command(
+            COMMAND checkout
+            ARGS_LIST ${GIT_LATEST_TAG_NAME}
+            WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
+        )
+
+        vcpkg_read_builtin_baseline(VCPKG_BASELINE_VERSION)
+        if(DEFINED VCPKG_BASELINE_VERSION AND NOT VCPKG_BASELINE_VERSION EQUAL "")
+            vcpkg_git_compare_timestamp(
+                INPUT_VERSION ${GIT_REVISION_VERSION}
+                BASELINE_VERSION ${VCPKG_BASELINE_VERSION}
+                RESULT GIT_COMPARE_TIMESTAMP_RESULT
+            )
+            if(GIT_COMPARE_TIMESTAMP_RESULT LESS 0)
+                # Baseline version is newer than the last tagged version
+                # Checking out specified baseline version.
+                vcpkg_git_execute_command(
+                    COMMAND checkout
+                    ARGS_LIST ${VCPKG_BASELINE_VERSION}
+                    WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
+                )
+            endif()
+        endif()
+    else()
+        # Invalid version has been specificed
+        message(FATAL_ERROR 
+            "[vcpkg] Invalid version has been specified ('${VCPKG_VERSION}'). "
+            "Please set the VCPKG_VERSION variable to either 'edge' or 'latest' "
+            "before including the vcpkg.cmake file.")
+    endif()
+endfunction()
+
+
+
+#######################################################################################
+## Function: vcpkg_git_compare_timestamp                                             ##
+##                                                                                   ##
+## - Compare the timestamp of two given commits.                                     ##
+##                                                                                   ##
+## Args:                                                                             ##
+##  - 'INPUT_VERSION': SHA1 hash of the version of the cloned repo.                  ##
+##  - 'BASELINE_VERSION': SHA1 hash of the baseline version to be compared against.  ##
+##  - 'RESULT': Output variable containing the result.                               ##
+##      - '0':  Both timestamps are equal.                                           ##
+##      - '1':  INPUT_VERSION is newer than BASELINE_VERSION.                        ##
+##      - '-1': INPUT_VERSION is older than BASELINE_VERSION!                        ##
+#######################################################################################
+function(vcpkg_git_compare_timestamp)
+    set(oneValueArgs INPUT_VERSION BASELINE_VERSION RESULT)
+    cmake_parse_arguments(GIT_TIMESTAMP "" "${oneValueArgs}" "" ${ARGN})
+
+    if(NOT DEFINED GIT_TIMESTAMP_INPUT_VERSION 
+       OR GIT_TIMESTAMP_INPUT_VERSION EQUAL ""
+       OR NOT DEFINED GIT_TIMESTAMP_BASELINE_VERSION 
+       OR GIT_TIMESTAMP_BASELINE_VERSION EQUAL "")
+        message(FATAL_ERROR 
+            "[vcpkg] Error: Function 'vcpkg_git_compare_timestamp' called with "
+            "invalid arugments. Missing required arguments.")
+    endif()
+
+    execute_process(
+        # Check if baseline version is in the repository
+        COMMAND ${GIT_EXECUTABLE} cat-file -e ${GIT_TIMESTAMP_BASELINE_VERSION}^{commit}
+        WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
+        RESULT_VARIABLE BASELINE_VERSION_EXSISTS
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+
+    if(NOT BASELINE_VERSION_EXSISTS EQUAL "0")
+        set(${GIT_TIMESTAMP_RESULT} -1 PARENT_SCOPE)
+        return()
+    endif()
+
+    vcpkg_git_execute_command(
+        COMMAND show
+        ARGS_LIST --format=\"%ct\" -s ${GIT_TIMESTAMP_BASELINE_VERSION}
+        WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
+        OUTPUT UNIX_TIMESTAMP_BASELINE_VERSION
+    )
+
+    vcpkg_git_execute_command(
+        COMMAND show
+        ARGS_LIST --format=\"%ct\" -s ${GIT_TIMESTAMP_INPUT_VERSION}
+        WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
+        OUTPUT UNIX_TIMESTAMP_INPUT_VERSION
+    )
+
+    if(DEFINED UNIX_TIMESTAMP_BASELINE_VERSION AND DEFINED UNIX_TIMESTAMP_INPUT_VERSION)
+        if(UNIX_TIMESTAMP_BASELINE_VERSION STREQUAL UNIX_TIMESTAMP_INPUT_VERSION)
+            set(${GIT_TIMESTAMP_RESULT} 0 PARENT_SCOPE)
+        elseif(UNIX_TIMESTAMP_BASELINE_VERSION STRGREATER UNIX_TIMESTAMP_INPUT_VERSION)
+            set(${GIT_TIMESTAMP_RESULT} -1 PARENT_SCOPE)
+        elseif(UNIX_TIMESTAMP_BASELINE_VERSION STRLESS UNIX_TIMESTAMP_INPUT_VERSION)
+            set(${GIT_TIMESTAMP_RESULT} 1 PARENT_SCOPE)
+        endif()
+    else()
+        set(${GIT_TIMESTAMP_RESULT} -1 PARENT)
+    endif()
+endfunction()
+
+
+#######################################################################################
+## Function: vcpkg_git_repository_reachable                                          ##
+##                                                                                   ##
+## Args:                                                                             ##
+##  - RESULT:                                                                        ##
+##      'True': Reachable                                                            ##
+##      'False': Not reachable                                                       ##
+#######################################################################################
+function(vcpkg_git_repository_reachable RESULT)
+    if(EXISTS ${GIT_EXECUTABLE})
+        execute_process(
+            # git ls-remote --exit-code https://github.com/Microsoft/vcpkg.git
+            COMMAND ${GIT_EXECUTABLE} ls-remote --exit-code ${VCPKG_REPO_URL}
+            WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
+            RESULT_VARIABLE RETURN_CODE
+            OUTPUT_QUIET
+        )
+        if(NOT ${RETURN_CODE} EQUAL "0")
+            set(${RESULT} False PARENT_SCOPE)
+            return()
+        endif()
+    else()
+        message(STATUS "[vcpkg] Git not found!")
+        return()
+        set(${RESULT} False PARENT_SCOPE)
+    endif()
+
+    set(${RESULT} True PARENT_SCOPE)
+endfunction()
+
+
+#######################################################################################
+## Function: vcpkg_execute_bootstrap                                                 ##
+##                                                                                   ##
+## - Executes the bootstrap script inside the vcpkg folder                           ##
+#######################################################################################
+function(vcpkg_execute_bootstrap)
+    message(STATUS "[vcpkg] Executing Bootstrap ...")
+
+    if(WIN32)
+        set(CMD_EXECUTABLE "cmd")
+        get_filename_component(
+            VCPKG_BOOTSTRAP_FILE
+            "${VCPKG_ROOT_DIR}/bootstrap-vcpkg.bat"
+            ABSOLUTE)
+    else()
+        set(CMD_EXECUTABLE "bash")
+        get_filename_component(
+            VCPKG_BOOTSTRAP_FILE
+            "${VCPKG_ROOT_DIR}/bootstrap-vcpkg.sh"
+            ABSOLUTE)
+    endif()
+
+    execute_process(
+        COMMAND ${CMD_EXECUTABLE} ${VCPKG_BOOTSTRAP_FILE} -disableMetrics
+        WORKING_DIRECTORY ${VCPKG_ROOT_DIR}
+        OUTPUT_QUIET
+        RESULT_VARIABLE VCPKG_BUILD_OK)
+    
+    if(NOT VCPKG_BUILD_OK EQUAL "0")
+        message(FATAL_ERROR "[vcpkg] Bootstrapping VCPKG failed!")
+    else()
+        message(STATUS "[vcpkg] Installed VCPKG!")
+    endif()
+endfunction()
+
+
+#######################################################################################
+## Function: vcpkg_set_environment                                                   ##
+##                                                                                   ##
+## - Sets environment and cache variables for next use.                              ##
+#######################################################################################
+function(vcpkg_set_environment)
+    message(STATUS "[vcpkg] Setting VCPKG Environment...")
+    if(WIN32)
+        get_filename_component(
+            VCPKG_EXECUTABLE
+            "${VCPKG_ROOT_DIR}/vcpkg.exe"
+            ABSOLUTE)
+    else()
+        get_filename_component(
+            VCPKG_EXECUTABLE
+            "${VCPKG_ROOT_DIR}/vcpkg"
+            ABSOLUTE)
+    endif()
+
+    get_filename_component(
+        VCPKG_TOOLCHAIN_FILE 
+        "${VCPKG_ROOT_DIR}/scripts/buildsystems/vcpkg.cmake"
+        ABSOLUTE)
+
+    if(NOT EXISTS ${VCPKG_EXECUTABLE})
+        message(FATAL_ERROR "[vcpkg] Unable to find VCPKG Executable!")
+    endif()
+
+    # Cache VCPKG Root Directory
+    set(VCPKG_ROOT_DIR ${VCPKG_ROOT_DIR} CACHE STRING "VCPKG Root" FORCE)
+
+    # Cache VCPKG_EXECUTABLE
+    set(VCPKG_EXECUTABLE ${VCPKG_EXECUTABLE} PARENT_SCOPE)
+    set(VCPKG_EXECUTABLE ${VCPKG_EXECUTABLE} CACHE STRING "VCPKG Executable" FORCE)
+
+    # Setting CMAKE_TOOLCHAIN_FILE
+    set(CMAKE_TOOLCHAIN_FILE "${VCPKG_TOOLCHAIN_FILE}")
+    set(CMAKE_TOOLCHAIN_FILE ${CMAKE_TOOLCHAIN_FILE} PARENT_SCOPE)
+    set(CMAKE_TOOLCHAIN_FILE ${CMAKE_TOOLCHAIN_FILE} CACHE STRING "")
+endfunction()
+
+
+#######################################################################################
+## Function: vcpkg_git_execute_command                                               ##
+##                                                                                   ##
+## - Executes a git command.                                                         ##
+##                                                                                   ##
+## Args:                                                                             ##
+##  - COMMAND: Input like 'checkout', 'clone' etc.                                   ## 
+##  - WORKING_DIRECTORY: Directory of the git repository.                            ##
+##  - OUTPUT: Output of the git command will be written to a passed variable.        ##
+##  - RESULT: Return value of the git process. Returns '0' on success.               ##  
+##  - ARGS_LIST: Input arguments to the git command. Expects a list.                 ##
+##  - VERBOSE: If this option is set the output from the git call will be printed.   ##
+#######################################################################################
+function(vcpkg_git_execute_command)
+    set(options VERBOSE)
+    set(oneValueArgs COMMAND WORKING_DIRECTORY OUTPUT RESULT)
+    set(multiValueArgs ARGS_LIST)
+    cmake_parse_arguments(GIT_EXECUTE "${options}"
+                          "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+
+    if(NOT DEFINED GIT_EXECUTABLE OR GIT_EXECUTABLE EQUAL "")
+        message(FATAL_ERROR 
+            "[vcpkg] Error: Git executable not found!")
+    elseif(NOT DEFINED GIT_EXECUTE_COMMAND OR GIT_EXECUTE_COMMAND EQUAL "")
+        message(FATAL_ERROR 
+            "[vcpkg] Error: In 'vcpkg_git_execute_command' git command undefined.")
+        return()
+    elseif(GIT_EXECUTE_WORKING_DIRECTORY EQUAL "" 
+           OR NOT DEFINED GIT_EXECUTE_WORKING_DIRECTORY)
+        message(FATAL_ERROR 
+            "[vcpkg] Error: In 'vcpkg_git_execute_command' git working directory undefined.")
+        return()
+    endif()
+
+    if(${GIT_EXECUTE_VERBOSE})
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} ${GIT_EXECUTE_COMMAND} ${GIT_EXECUTE_ARGS_LIST}
+            WORKING_DIRECTORY ${GIT_EXECUTE_WORKING_DIRECTORY}
+            OUTPUT_VARIABLE GIT_EXECUTE_OUTPUT_VALUE
+            RESULT_VARIABLE GIT_EXECUTE_RESULT_VALUE
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            COMMAND_ERROR_IS_FATAL ANY
+            COMMAND_ECHO STDOUT)
+    else()
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} ${GIT_EXECUTE_COMMAND} ${GIT_EXECUTE_ARGS_LIST}
+            WORKING_DIRECTORY ${GIT_EXECUTE_WORKING_DIRECTORY}
+            OUTPUT_VARIABLE GIT_EXECUTE_OUTPUT_VALUE
+            RESULT_VARIABLE GIT_EXECUTE_RESULT_VALUE
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            COMMAND_ERROR_IS_FATAL ANY)
+    endif()
+
+    if(DEFINED GIT_EXECUTE_OUTPUT AND NOT GIT_EXECUTE_OUTPUT EQUAL "")
+        set(${GIT_EXECUTE_OUTPUT} ${GIT_EXECUTE_OUTPUT_VALUE} PARENT_SCOPE)
+    endif()
+    if(DEFINED GIT_EXECUTE_RESULT AND NOT GIT_EXECUTE_RESULT EQUAL "")
+        set(${GIT_EXECUTE_RESULT} ${GIT_EXECUTE_RESULT_VALUE} PARENT_SCOPE)
+    endif()
+endfunction()
+
+
+#######################################################################################
+## Function: vcpkg_read_builtin_baseline                                             ##
+##                                                                                   ##
+## - Reads the builtin-version setting from the vcpkg.json manifest file             ##
+##                                                                                   ##
+## Args:                                                                             ##
+##  'OUTPUT_VERSION': The builtin-version as a SHA1 string                           ##
+#######################################################################################
+function(vcpkg_read_builtin_baseline OUTPUT_VERSION)
+    if(EXISTS "${CMAKE_SOURCE_DIR}/vcpkg.json")
+        file(READ "${CMAKE_SOURCE_DIR}/vcpkg.json" VCPKG_MANIFEST_JSON)
+        string(JSON BUILTIN_BASELINE 
+               ERROR_VARIABLE ERROR_MESSAGE
+               GET ${VCPKG_MANIFEST_JSON} "builtin-baseline")
+        if(ERROR_MESSAGE STREQUAL "" OR NOT DEFINED ERROR_MESSAGE)
+            set(${OUTPUT_VERSION} ${BUILTIN_BASELINE} PARENT_SCOPE)
+        endif()
+    endif()
+endfunction()
+
+
+#######################################################################################
+## Function: vcpkg_is_path_in_project                                                ##
+##                                                                                   ##
+## - Checks if the given path is inside this project ('CMAKE_SOURCE_DIR')            ##
+##                                                                                   ##
+## Args:                                                                             ##
+##  'PATH': Path to be checked against root of the project directory                 ##
+##  'RESULT': True if inside the project, otherwise false                            ##
+#######################################################################################
+function(vcpkg_is_path_in_project)
+    cmake_parse_arguments(PATH_CHECK "" "PATH;RESULT" "" ${ARGN})
+
+    if(PATH_CHECK_PATH STREQUAL "" OR NOT DEFINED PATH_CHECK_PATH
+       OR PATH_CHECK_RESULT STREQUAL "" OR NOT DEFINED PATH_CHECK_RESULT)
+        message(FATAL_ERROR 
+            "[vcpkg] Error: Called function 'vcpkg_is_path_in_project' "
+            "with invalid arguments. Missing required arguments.")
+    else()
+        string(TOLOWER ${CMAKE_SOURCE_DIR} PROJECT_ROOT_LOWERCASE)
+        string(TOLOWER ${PATH_CHECK_PATH} PATH_LOWERCASE)
+        string(REGEX MATCH ${PROJECT_ROOT_LOWERCASE} TEST_PATH ${PATH_LOWERCASE})
+        if(TEST_PATH STREQUAL "")
+            set(${PATH_CHECK_RESULT} FALSE PARENT_SCOPE)
+        else()
+            set(${PATH_CHECK_RESULT} TRUE PARENT_SCOPE)
+        endif()
     endif()
 endfunction()
 
